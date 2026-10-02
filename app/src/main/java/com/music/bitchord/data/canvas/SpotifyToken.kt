@@ -8,7 +8,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import com.music.bitchord.data.DebugLog as Log
+import com.music.bitchord.data.canvas.CanvasLog as Log
 import com.music.bitchord.data.Http
 import com.music.bitchord.data.settings.AppSettings
 import kotlinx.coroutines.CompletableDeferred
@@ -189,7 +189,13 @@ internal object SpotifyToken {
                 // The player also mints an anonymous token before the cookie
                 // takes effect; that one can't read canvases, so keep waiting
                 // for the logged-in one.
-                if (token.isNullOrBlank() || anonymous) return
+                if (token.isNullOrBlank()) return
+                if (anonymous) {
+                    // Only ever seeing this one, then timing out, means the
+                    // page never took the cookie: expired, revoked or mistyped.
+                    Log.d(TAG, "page minted an anonymous token; waiting for a logged-in one")
+                    return
+                }
                 val expiresAt = root["accessTokenExpirationTimestampMs"]?.jsonPrimitive?.contentOrNull
                     ?.toLongOrNull()?.takeIf { it > System.currentTimeMillis() }
                     ?: (System.currentTimeMillis() + DEFAULT_TOKEN_LIFETIME_MS)

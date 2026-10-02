@@ -1,6 +1,6 @@
 package com.music.bitchord.data.canvas
 
-import com.music.bitchord.data.DebugLog as Log
+import com.music.bitchord.data.canvas.CanvasLog as Log
 import com.music.bitchord.data.Http
 import com.google.protobuf.CodedInputStream
 import com.google.protobuf.CodedOutputStream
@@ -61,6 +61,7 @@ object SpotifyCanvas {
     private data class TrackHit(val uri: String, val title: String, val artist: String, val album: String?)
 
     suspend fun search(title: String, artist: String, album: String?): CanvasArtwork? {
+        Log.d(TAG, "looking up '$title' by '$artist' (album: ${album ?: "unknown"})")
         val token = SpotifyToken.accessToken()
         if (token == null) {
             Log.d(TAG, "no access token (cookie unset or mint failed); skipping")

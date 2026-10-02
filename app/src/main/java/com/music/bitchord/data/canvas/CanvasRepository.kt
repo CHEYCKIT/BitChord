@@ -1,6 +1,7 @@
 package com.music.bitchord.data.canvas
 
-import com.music.bitchord.data.DebugLog as Log
+import com.music.bitchord.data.canvas.CanvasLog as Log
+import com.music.bitchord.data.TrackLog
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.settings.AppSettings
 import kotlinx.coroutines.Dispatchers
@@ -88,21 +89,24 @@ object CanvasRepository {
         val spotifyFirst = AppSettings.prioritizeSpotifyCanvas.value
         val key = cacheKey("song|${song.videoId}", spotifyFirst)
 
-        return resolve(key, album != null) {
-            if (spotifyFirst) {
-                firstHit(
-                    { SpotifyCanvas.search(title, artist, album) },
-                    { AppleMusicCanvas.search(title, artist, album) },
-                    { TidalCanvas.search(title, artist, album) },
-                    { CommunityCanvas.search(title, artist, album) },
-                ) { it.matches(title, artist, album) }
-            } else {
-                firstHit(
-                    { AppleMusicCanvas.search(title, artist, album) },
-                    { TidalCanvas.search(title, artist, album) },
-                    { CommunityCanvas.search(title, artist, album) },
-                    { SpotifyCanvas.search(title, artist, album) },
-                ) { it.matches(title, artist, album) }
+        // Filed against the track, so its Copy Log carries the canvas lookup.
+        return withContext(TrackLog.about(song.videoId)) {
+            resolve(key, album != null) {
+                if (spotifyFirst) {
+                    firstHit(
+                        { SpotifyCanvas.search(title, artist, album) },
+                        { AppleMusicCanvas.search(title, artist, album) },
+                        { TidalCanvas.search(title, artist, album) },
+                        { CommunityCanvas.search(title, artist, album) },
+                    ) { it.matches(title, artist, album) }
+                } else {
+                    firstHit(
+                        { AppleMusicCanvas.search(title, artist, album) },
+                        { TidalCanvas.search(title, artist, album) },
+                        { CommunityCanvas.search(title, artist, album) },
+                        { SpotifyCanvas.search(title, artist, album) },
+                    ) { it.matches(title, artist, album) }
+                }
             }
         }
     }
