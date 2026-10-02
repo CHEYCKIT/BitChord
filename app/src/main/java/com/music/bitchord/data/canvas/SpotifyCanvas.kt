@@ -282,11 +282,64 @@ object SpotifyCanvas {
         return wanted.all { want -> credited.any { it == want } }
     }
 
+    // ---- Pathfinder: the current Spotify web player's Canvas query -------
+
+    private val queryHashes = SpotifyCanvasQuery.QueryHashes(fetch = { url ->
+        runCatching {
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", CANVAS_UA)
+                .build()
+            Http.client.newCall(request).execute().use { response ->
+                if (response.isSuccessful) response.body?.string() else null
+            }
+        }.getOrNull()
+    })
+
+    private fun fetchCanvasUrl(trackUri: String, token: String): String? =
+        when (val answer = fetchCanvasViaPathfinder(trackUri, token)) {
+            is SpotifyCanvasQuery.Answer.Found -> {
+                Log.d(TAG, "pathfinder canvas (${answer.type ?: "no type"}) for $trackUri")
+                answer.url
+            }
+            SpotifyCanvasQuery.Answer.NoCanvas -> {
+                Log.d(TAG, "pathfinder: no canvas for $trackUri")
+                null
+            }
+            is SpotifyCanvasQuery.Answer.Failed -> {
+                Log.w(TAG, "pathfinder canvas query failed (${answer.reason}); trying canvaz-cache")
+                fetchCanvasViaCanvaz(trackUri, token)
+            }
+        }
+
+    private fun fetchCanvasViaPathfinder(trackUri: String, token: String, isRetry: Boolean = false): SpotifyCanvasQuery.Answer {
+        val hash = queryHashes.canvasHash(forceRefresh = isRetry)
+        val request = Request.Builder()
+            .url(SpotifyCanvasQuery.ENDPOINT)
+            .post(SpotifyCanvasQuery.requestBody(trackUri, hash).toRequestBody("application/json".toMediaType()))
+            .apply { authHeaders(token).forEach { (name, value) -> header(name, value) } }
+            .header("App-platform", "WebPlayer")
+            .header("Accept", "application/json")
+            .header("Accept-Language", "en")
+            .build()
+        val (code, body) = runCatching {
+            Http.client.newCall(request).execute().use { response ->
+                response.code to if (response.isSuccessful) response.body?.string() else null
+            }
+        }.getOrElse { return SpotifyCanvasQuery.Answer.Failed("request threw: ${it.message}") }
+        if (body == null) return SpotifyCanvasQuery.Answer.Failed("http $code")
+        val answer = SpotifyCanvasQuery.parse(body)
+        if (answer is SpotifyCanvasQuery.Answer.Failed && answer.staleHash && !isRetry) {
+            return fetchCanvasViaPathfinder(trackUri, token, isRetry = true)
+        }
+        return answer
+    }
+
     // ---- canvaz-cache: protobuf request/response -----------------------
 
     private data class CanvasHit(val id: String?, val url: String, val trackUri: String?)
 
-    private fun fetchCanvasUrl(trackUri: String, token: String): String? {
+    private fun fetchCanvasViaCanvaz(trackUri: String, token: String): String? {
         val requestBody = encodeCanvasRequest(trackUri)
             .toRequestBody("application/protobuf".toMediaType())
         val request = Request.Builder()
