@@ -45,6 +45,7 @@ internal object SpotifyToken {
     private const val BRIDGE_NAME = "BitChordSpotifyTokenBridge"
     private const val HARVEST_TIMEOUT_MS = 20_000L
     private const val DEFAULT_TOKEN_LIFETIME_MS = 3_600_000L
+    private const val WEBPLAYER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
     private val harvestMutex = Mutex()
@@ -147,7 +148,7 @@ internal object SpotifyToken {
             webView = WebView(context).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
-                settings.userAgentString = CANVAS_UA
+                settings.userAgentString = WEBPLAYER_UA
                 cookieManager.setAcceptThirdPartyCookies(this, true)
                 addJavascriptInterface(TokenBridge(deferred, { latestClientToken = it }, { latestClientToken }), BRIDGE_NAME)
 
@@ -313,7 +314,7 @@ internal object SpotifyToken {
 
         val request = Request.Builder()
             .url("https://open.spotify.com")
-            .header("User-Agent", CANVAS_UA)
+            .header("User-Agent", WEBPLAYER_UA)
             .build()
         val (html, deviceId) = runCatching {
             Http.client.newCall(request).execute().use { response ->
