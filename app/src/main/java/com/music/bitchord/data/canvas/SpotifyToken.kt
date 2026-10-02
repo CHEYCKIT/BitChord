@@ -149,7 +149,7 @@ internal object SpotifyToken {
                 settings.domStorageEnabled = true
                 settings.userAgentString = CANVAS_UA
                 cookieManager.setAcceptThirdPartyCookies(this, true)
-                addJavascriptInterface(TokenBridge(deferred) { latestClientToken }, BRIDGE_NAME)
+                addJavascriptInterface(TokenBridge(deferred, { latestClientToken = it }, { latestClientToken }), BRIDGE_NAME)
 
                 webViewClient = object : WebViewClient() {
                     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
@@ -190,7 +190,8 @@ internal object SpotifyToken {
     /** Receives the access token and client-token from the same Web Player session. */
     private class TokenBridge(
         private val deferred: CompletableDeferred<HarvestedToken?>,
-        private val clientToken: () -> Pair<String, Long>?,
+        private val setClientToken: (Pair<String, Long>) -> Unit,
+        private val getClientToken: () -> Pair<String, Long>?,
     ) {
         @JavascriptInterface
         fun onTokenPayload(payload: String?) {
@@ -208,7 +209,7 @@ internal object SpotifyToken {
                     ?.toLongOrNull()?.takeIf { it > System.currentTimeMillis() }
                     ?: (System.currentTimeMillis() + DEFAULT_TOKEN_LIFETIME_MS)
                 val clientId = root["clientId"]?.jsonPrimitive?.contentOrNull
-                val ct = clientToken()
+                val ct = getClientToken()
                 deferred.complete(HarvestedToken(token, expiresAt, clientId, ct?.first, ct?.second ?: 0L))
             }
         }
@@ -222,7 +223,7 @@ internal object SpotifyToken {
                 val granted = root["granted_token"]?.jsonObject ?: return
                 val token = granted["token"]?.jsonPrimitive?.contentOrNull ?: return
                 val ttl = granted["expires_after_seconds"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 3600L
-                latestClientToken = token to (System.currentTimeMillis() + ttl * 1000L)
+                setClientToken(token to (System.currentTimeMillis() + ttl * 1000L))
                 Log.d(TAG, "captured WebPlayer client token, good for " + ttl + "s")
             }
         }
