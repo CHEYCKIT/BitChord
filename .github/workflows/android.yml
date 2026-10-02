@@ -29,6 +29,15 @@ jobs:
     - name: Build Dev Debug APK
       run: ./gradlew assembleDevDebug
 
+    - name: Build Prod Debug APK
+      run: ./gradlew assembleProdDebug
+
+    - name: Upload Debug APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: bitchord-prod-debug
+        path: app/build/outputs/apk/prod/debug/*.apk
+
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
