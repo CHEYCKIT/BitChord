@@ -169,7 +169,7 @@ object SpotifyCanvas {
         return TrackHit(uri, title, artist, album)
     }
 
-    private fun searchViaRest(title: String, artist: String, album: String?, token: String): TrackHit? {
+    private suspend fun searchViaRest(title: String, artist: String, album: String?, token: String): TrackHit? {
         val query = listOfNotNull(title, artist, album).joinToString(" ")
         val url = SEARCH_URL.toHttpUrl().newBuilder()
             .addQueryParameter("q", query)
