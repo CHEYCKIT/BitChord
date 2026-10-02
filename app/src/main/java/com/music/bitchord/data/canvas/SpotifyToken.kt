@@ -8,6 +8,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import org.json.JSONObject
 import com.music.bitchord.data.canvas.CanvasLog as Log
 import com.music.bitchord.data.Http
 import com.music.bitchord.data.settings.AppSettings
@@ -188,6 +189,97 @@ internal object SpotifyToken {
         }
     }
 
+    /** Execute Spotify Canvas inside the authenticated WebPlayer WebView. */
+    suspend fun canvasViaWebPlayer(trackUri: String, hash: String): String? {
+        val cookie = AppSettings.spotifySpdcToken.value
+        val context = appContext
+        if (cookie.isBlank() || context == null) return null
+        return harvestMutex.withLock {
+            val tokenDeferred = CompletableDeferred<HarvestedToken?>()
+            val canvasDeferred = CompletableDeferred<String?>()
+            var latestClientToken: Pair<String, Long>? = null
+            val cookieManager = CookieManager.getInstance().apply {
+                setAcceptCookie(true)
+                setCookie("https://open.spotify.com/", "sp_dc=$cookie; Domain=.spotify.com; Path=/; Secure")
+                setCookie("https://accounts.spotify.com/", "sp_dc=$cookie; Domain=.spotify.com; Path=/; Secure")
+                flush()
+            }
+            var webView: WebView? = null
+            try {
+                webView = withContext(Dispatchers.Main) {
+                    WebView(context).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.userAgentString = WEBPLAYER_UA
+                        cookieManager.setAcceptThirdPartyCookies(this, true)
+                        addJavascriptInterface(TokenBridge(tokenDeferred, { latestClientToken = it }, { latestClientToken }), BRIDGE_NAME + "Token")
+                        addJavascriptInterface(CanvasBridge(canvasDeferred), BRIDGE_NAME + "Canvas")
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                                super.onPageStarted(view, url, favicon)
+                                view.evaluateJavascript(HOOK_SCRIPT, null)
+                            }
+                            override fun onPageFinished(view: WebView, url: String?) {
+                                super.onPageFinished(view, url)
+                                view.evaluateJavascript(HOOK_SCRIPT, null)
+                            }
+                        }
+                        loadUrl("https://open.spotify.com/")
+                    }
+                }
+                val harvested = withTimeoutOrNull(HARVEST_TIMEOUT_MS) { tokenDeferred.await() } ?: return@withLock null
+                val clientToken = harvested.clientToken ?: latestClientToken?.first
+                val clientVersion = session()?.clientVersion ?: ""
+                val body = JSONObject().apply {
+                    put("operationName", "canvas")
+                    put("variables", JSONObject().put("trackUri", trackUri))
+                    put("extensions", JSONObject().put("persistedQuery", JSONObject().put("version", 1).put("sha256Hash", hash)))
+                }.toString()
+                val clientHeader = if (clientToken != null) "\"Client-Token\": " + JSONObject.quote(clientToken) + "," else ""
+                val script = """
+                    (async function() {
+                      try {
+                        const r = await fetch("https://api-partner.spotify.com/pathfinder/v2/query", {
+                          method: "POST",
+                          credentials: "include",
+                          headers: {
+                            "Authorization": "Bearer " + %TOKEN%,
+                            "Content-Type": "application/json",
+                            "Accept": "application/json",
+                            "App-Platform": "WebPlayer",
+                            "User-Agent": %UA%,
+                            "Spotify-App-Version": %VERSION%,
+                            %CLIENT%
+                            "Origin": "https://open.spotify.com",
+                            "Referer": "https://open.spotify.com/"
+                          },
+                          body: %BODY%
+                        });
+                        BitChordSpotifyTokenBridgeCanvas.onCanvasResponse(await r.text());
+                      } catch (e) { BitChordSpotifyTokenBridgeCanvas.onCanvasResponse(""); }
+                    })();
+                """.trimIndent()
+                    .replace("%TOKEN%", JSONObject.quote(harvested.token))
+                    .replace("%UA%", JSONObject.quote(WEBPLAYER_UA))
+                    .replace("%VERSION%", JSONObject.quote(clientVersion))
+                    .replace("%CLIENT%", clientHeader)
+                    .replace("%BODY%", JSONObject.quote(body))
+                withContext(Dispatchers.Main) { webView?.evaluateJavascript(script, null) }
+                withTimeoutOrNull(HARVEST_TIMEOUT_MS) { canvasDeferred.await() }
+            } catch (e: Exception) {
+                Log.w(TAG, "WebPlayer canvas request threw: ${e.message}")
+                null
+            } finally {
+                withContext(Dispatchers.Main) { runCatching { webView?.removeJavascriptInterface(BRIDGE_NAME + "Token"); webView?.removeJavascriptInterface(BRIDGE_NAME + "Canvas"); webView?.stopLoading(); webView?.destroy() } }
+            }
+        }
+    }
+
+    private class CanvasBridge(private val deferred: CompletableDeferred<String?>) {
+        @JavascriptInterface fun onCanvasResponse(payload: String?) {
+            if (!deferred.isCompleted) deferred.complete(payload?.takeIf { it.isNotBlank() })
+        }
+    }
     /** Receives the access token and client-token from the same Web Player session. */
     private class TokenBridge(
         private val deferred: CompletableDeferred<HarvestedToken?>,
