@@ -171,7 +171,7 @@ internal object SpotifyToken {
             if (harvested != null && harvested.clientToken == null) {
                 kotlinx.coroutines.delay(1500)
                 val ct = latestClientToken
-                if (ct != null) return@withContext harvested.copy(clientToken = ct.first, clientTokenExpiresAt = ct.second)
+                if (ct != null) return@try harvested.copy(clientToken = ct.first, clientTokenExpiresAt = ct.second)
             }
             harvested
         } catch (e: Exception) {
