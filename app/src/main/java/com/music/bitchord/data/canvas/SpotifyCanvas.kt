@@ -53,7 +53,7 @@ object SpotifyCanvas {
      * spclient gates this path to Spotify's own apps by user agent; the web
      * player's own UA is turned away, so this wears a mobile client's instead.
      */
-    private const val SPOTIFY_APP_UA = "Spotify/9.0.34.593 iOS/18.4 (iPhone15,3)"
+    private const val SPOTIFY_APP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
     private val CANVAS_URL_REGEX = Regex("""https://[^"'\s\x00-\x1F]+\.cnvs\.mp4""")
