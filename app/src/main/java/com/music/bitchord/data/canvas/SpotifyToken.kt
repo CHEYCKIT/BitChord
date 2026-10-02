@@ -294,6 +294,43 @@ internal object SpotifyToken {
      * endpoint does with that. Requires [accessToken] to have already
      * succeeded once, since the client id it needs comes off that response.
      */
+    /**
+     * Fallback client-token minted with Spotify's documented Web Player SDK
+     * identity. Some Pathfinder sessions return an empty canvas object when
+     * the client-token harvested from WebView is accepted for ordinary web
+     * traffic but not for Canvas. Keep this separate from the harvested token
+     * so the normal WebPlayer session remains the first attempt.
+     */
+    suspend fun fallbackClientToken(): String? = withContext(Dispatchers.IO) {
+        val body = buildJsonObject {
+            putJsonObject("client_data") {
+                put("client_version", "1.2.42.432.g3121")
+                put("client_id", "d8a5ed958d274c2e8ee717e6a4b0971d")
+                putJsonObject("js_sdk_data") {
+                    put("device_brand", "Apple")
+                    put("device_model", "MacBookPro")
+                    put("os", "Mac OS")
+                    put("os_version", "10.15.7")
+                    put("device_id", java.util.UUID.randomUUID().toString().replace("-", ""))
+                    put("device_type", "computer")
+                }
+            }
+        }.toString()
+        runCatching {
+            val request = Request.Builder()
+                .url("https://clienttoken.spotify.com/v1/clienttoken")
+                .post(body.toRequestBody("application/json".toMediaType()))
+                .header("Accept", "application/json")
+                .header("User-Agent", WEBPLAYER_UA)
+                .build()
+            Http.client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return@use null
+                val root = response.body?.string()?.let { json.parseToJsonElement(it).jsonObject }
+                root?.get("granted_token")?.jsonObject?.get("token")?.jsonPrimitive?.contentOrNull
+            }
+        }.getOrNull()
+    }
+
     @Synchronized
     fun clientToken(): String? {
         val now = System.currentTimeMillis()
