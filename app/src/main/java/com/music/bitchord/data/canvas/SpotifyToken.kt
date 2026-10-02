@@ -302,16 +302,18 @@ internal object SpotifyToken {
      * so the normal WebPlayer session remains the first attempt.
      */
     suspend fun fallbackClientToken(): String? = withContext(Dispatchers.IO) {
+        val session = session() ?: return@withContext null
+        val clientId = cachedClientId ?: return@withContext null
         val body = buildJsonObject {
             putJsonObject("client_data") {
-                put("client_version", "1.2.42.432.g3121")
-                put("client_id", "d8a5ed958d274c2e8ee717e6a4b0971d")
+                put("client_version", session.clientVersion)
+                put("client_id", clientId)
                 putJsonObject("js_sdk_data") {
-                    put("device_brand", "Apple")
-                    put("device_model", "MacBookPro")
-                    put("os", "Mac OS")
-                    put("os_version", "10.15.7")
-                    put("device_id", java.util.UUID.randomUUID().toString().replace("-", ""))
+                    put("device_brand", "unknown")
+                    put("device_model", "unknown")
+                    put("os", "windows")
+                    put("os_version", "NT 10.0")
+                    put("device_id", session.deviceId)
                     put("device_type", "computer")
                 }
             }
@@ -320,6 +322,7 @@ internal object SpotifyToken {
             val request = Request.Builder()
                 .url("https://clienttoken.spotify.com/v1/clienttoken")
                 .post(body.toRequestBody("application/json".toMediaType()))
+                .header("Authority", "clienttoken.spotify.com")
                 .header("Accept", "application/json")
                 .header("User-Agent", WEBPLAYER_UA)
                 .build()
@@ -330,6 +333,8 @@ internal object SpotifyToken {
             }
         }.getOrNull()
     }
+
+    fun clientVersion(): String? = session()?.clientVersion
 
     @Synchronized
     fun clientToken(): String? {
