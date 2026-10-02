@@ -271,10 +271,10 @@ internal object SpotifyToken {
                 putJsonObject("js_sdk_data") {
                     put("device_brand", "unknown")
                     put("device_model", "unknown")
-                    put("os", "android")
-                    put("os_version", android.os.Build.VERSION.RELEASE.orEmpty())
+                    put("os", "windows")
+                    put("os_version", "NT 10.0")
                     put("device_id", session.deviceId)
-                    put("device_type", "smartphone")
+                    put("device_type", "computer")
                 }
             }
         }
@@ -289,6 +289,8 @@ internal object SpotifyToken {
             .post(payload.toString().toByteArray(Charsets.UTF_8).toRequestBody("application/json".toMediaType()))
             .header("Accept", "application/json")
             .header("User-Agent", CANVAS_UA)
+            .header("Origin", "https://open.spotify.com")
+            .header("Referer", "https://open.spotify.com/")
             .build()
 
         var lastCode = -1
@@ -324,7 +326,7 @@ internal object SpotifyToken {
 
         cachedClientToken = token
         clientTokenExpiresAtMs = now + ttlSeconds * 1000
-        Log.d(TAG, "minted client token, good for ${ttlSeconds}s")
+        Log.d(TAG, "minted client token, good for ${ttlSeconds}s (web-player identity)")
         return token
     }
 
