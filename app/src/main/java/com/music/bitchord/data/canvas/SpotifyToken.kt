@@ -212,7 +212,7 @@ internal object SpotifyToken {
                         settings.domStorageEnabled = true
                         settings.userAgentString = WEBPLAYER_UA
                         cookieManager.setAcceptThirdPartyCookies(this, true)
-                        addJavascriptInterface(TokenBridge(tokenDeferred, { latestClientToken = it }, { latestClientToken }), BRIDGE_NAME + "Token")
+                        addJavascriptInterface(TokenBridge(tokenDeferred, { latestClientToken = it }, { latestClientToken }), BRIDGE_NAME)
                         addJavascriptInterface(CanvasBridge(canvasDeferred), BRIDGE_NAME + "Canvas")
                         webViewClient = object : WebViewClient() {
                             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
@@ -228,43 +228,12 @@ internal object SpotifyToken {
                     }
                 }
                 val harvested = withTimeoutOrNull(HARVEST_TIMEOUT_MS) { tokenDeferred.await() } ?: return@withLock null
-                val clientToken = harvested.clientToken ?: latestClientToken?.first
-                val clientVersion = session()?.clientVersion ?: ""
-                val body = JSONObject().apply {
-                    put("operationName", "canvas")
-                    put("variables", JSONObject().put("trackUri", trackUri))
-                    put("extensions", JSONObject().put("persistedQuery", JSONObject().put("version", 1).put("sha256Hash", hash)))
-                }.toString()
-                val clientHeader = if (clientToken != null) "\"Client-Token\": " + JSONObject.quote(clientToken) + "," else ""
-                val script = """
-                    (async function() {
-                      try {
-                        const r = await fetch("https://api-partner.spotify.com/pathfinder/v2/query", {
-                          method: "POST",
-                          credentials: "include",
-                          headers: {
-                            "Authorization": "Bearer " + %TOKEN%,
-                            "Content-Type": "application/json",
-                            "Accept": "application/json",
-                            "App-Platform": "WebPlayer",
-                            "User-Agent": %UA%,
-                            "Spotify-App-Version": %VERSION%,
-                            %CLIENT%
-                            "Origin": "https://open.spotify.com",
-                            "Referer": "https://open.spotify.com/"
-                          },
-                          body: %BODY%
-                        });
-                        BitChordSpotifyTokenBridgeCanvas.onCanvasResponse(await r.text());
-                      } catch (e) { BitChordSpotifyTokenBridgeCanvas.onCanvasResponse(""); }
-                    })();
-                """.trimIndent()
-                    .replace("%TOKEN%", JSONObject.quote(harvested.token))
-                    .replace("%UA%", JSONObject.quote(WEBPLAYER_UA))
-                    .replace("%VERSION%", JSONObject.quote(clientVersion))
-                    .replace("%CLIENT%", clientHeader)
-                    .replace("%BODY%", JSONObject.quote(body))
-                withContext(Dispatchers.Main) { webView?.evaluateJavascript(script, null) }
+                val trackId = trackUri.substringAfterLast(':')
+                val trackUrl = "https://open.spotify.com/track/$trackId"
+                Log.d(TAG, "WebPlayer: loading $trackUrl and waiting for Spotify's Pathfinder Canvas response")
+                withContext(Dispatchers.Main) {
+                    webView?.loadUrl(trackUrl)
+                }
                 withTimeoutOrNull(HARVEST_TIMEOUT_MS) { canvasDeferred.await() }
             } catch (e: Exception) {
                 Log.w(TAG, "WebPlayer canvas request threw: ${e.message}")
@@ -277,7 +246,10 @@ internal object SpotifyToken {
 
     private class CanvasBridge(private val deferred: CompletableDeferred<String?>) {
         @JavascriptInterface fun onCanvasResponse(payload: String?) {
-            if (!deferred.isCompleted) deferred.complete(payload?.takeIf { it.isNotBlank() })
+            if (!deferred.isCompleted && !payload.isNullOrBlank()) {
+                Log.d(TAG, "captured WebPlayer Pathfinder response (${payload.length} bytes)")
+                deferred.complete(payload)
+            }
         }
     }
     /** Receives the access token and client-token from the same Web Player session. */
@@ -335,6 +307,16 @@ internal object SpotifyToken {
           var isClientToken = function (u) {
             try { return String(u).indexOf('clienttoken.spotify.com/v1/clienttoken') !== -1; } catch (e) { return false; }
           };
+          var isPathfinder = function (u) {
+            try { return String(u).indexOf('api-partner.spotify.com/pathfinder/') !== -1; } catch (e) { return false; }
+          };
+          var reportPathfinder = function (body) {
+            try {
+              if (body && String(body).indexOf('"trackUnion"') !== -1) {
+                ${BRIDGE_NAME}Canvas.onCanvasResponse(body);
+              }
+            } catch (e) {}
+          };
           var origFetch = window.fetch;
           if (origFetch) {
             window.fetch = function (input, init) {
@@ -348,6 +330,15 @@ internal object SpotifyToken {
                         if (isClientToken(url)) $BRIDGE_NAME.onClientTokenPayload(body);
                         else report(body);
                       } catch (e) {}
+                    }).catch(function () {});
+                  }).catch(function () {});
+                } catch (e) {}
+              }
+              if (isPathfinder(url)) {
+                try {
+                  result.then(function (res) {
+                    res.clone().text().then(function (body) {
+                      reportPathfinder(body);
                     }).catch(function () {});
                   }).catch(function () {});
                 } catch (e) {}
@@ -370,6 +361,9 @@ internal object SpotifyToken {
                     if (isClientToken(xhr.__bitchordUrl)) $BRIDGE_NAME.onClientTokenPayload(xhr.responseText);
                     else report(xhr.responseText);
                   } catch (e) {}
+                }
+                if (isPathfinder(xhr.__bitchordUrl)) {
+                  try { reportPathfinder(xhr.responseText); } catch (e) {}
                 }
               });
             } catch (e) {}
