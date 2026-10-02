@@ -166,7 +166,29 @@ object SpotifyCanvas {
             Log.w(TAG, "pathfinder hit had neither uri nor id")
             return null
         }
-        return TrackHit(uri, title, artist, album)
+
+        val hitTitle = firstItem["name"]?.jsonPrimitive?.contentOrNull
+        val hitArtists = firstItem["artists"]?.jsonArray
+            ?.mapNotNull { it.jsonObject["name"]?.jsonPrimitive?.contentOrNull }
+            ?: firstItem["artists"]?.jsonObject?.get("items")?.jsonArray
+                ?.mapNotNull {
+                    it.jsonObject["data"]?.jsonObject?.get("name")?.jsonPrimitive?.contentOrNull
+                        ?: it.jsonObject["name"]?.jsonPrimitive?.contentOrNull
+                }
+                .orEmpty()
+        val hitAlbum = firstItem["album"]?.jsonObject?.get("name")?.jsonPrimitive?.contentOrNull
+            ?: firstItem["albumOfTrack"]?.jsonObject?.get("name")?.jsonPrimitive?.contentOrNull
+            ?: firstItem["albumOfTrack"]?.jsonObject?.get("data")?.jsonObject?.get("name")?.jsonPrimitive?.contentOrNull
+
+        if (hitTitle == null || hitArtists.isEmpty()) {
+            Log.w(TAG, "pathfinder hit had no usable title/artist metadata")
+            return null
+        }
+        if (!isMatch(hitTitle, hitArtists, title, artist)) {
+            Log.d(TAG, "pathfinder first hit did not match '$title' by '$artist': '$hitTitle' by '${hitArtists.joinToString(", ")}'")
+            return null
+        }
+        return TrackHit(uri, hitTitle, hitArtists.joinToString(", "), hitAlbum ?: album)
     }
 
     private suspend fun searchViaRest(title: String, artist: String, album: String?, token: String): TrackHit? {
