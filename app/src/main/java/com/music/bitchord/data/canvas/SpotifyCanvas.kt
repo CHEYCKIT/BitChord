@@ -271,7 +271,9 @@ object SpotifyCanvas {
      * since some of these endpoints still answer without it.
      */
     private fun authHeaders(token: String): Map<String, String> {
-        val headers = mutableMapOf("Authorization" to "Bearer $token", "User-Agent" to CANVAS_UA)
+        // REST/Pathfinder requests are WebPlayer traffic. The iOS UA is only
+        // for the legacy canvaz-cache endpoint, which explicitly expects it.
+        val headers = mutableMapOf("Authorization" to "Bearer $token", "User-Agent" to WEBPLAYER_UA)
         SpotifyToken.clientToken()?.let { headers["Client-Token"] = it }
         return headers
     }
