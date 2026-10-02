@@ -357,6 +357,7 @@ object SpotifyCanvas {
                     .header("Client-Token", fallback)
                     .header("Content-Type", "application/json")
                     .header("App-Platform", "WebPlayer")
+                    .apply { SpotifyToken.clientVersion()?.let { header("Spotify-App-Version", it) } }
                     .header("Accept", "application/json")
                     .header("Accept-Language", "en")
                     .header("Origin", "https://open.spotify.com")
