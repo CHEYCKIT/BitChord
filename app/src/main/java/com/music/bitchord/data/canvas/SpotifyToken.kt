@@ -303,7 +303,7 @@ internal object SpotifyToken {
      */
     suspend fun fallbackClientToken(): String? = withContext(Dispatchers.IO) {
         val session = session() ?: return@withContext null
-        val clientId = cachedClientId ?: return@withContext null
+        val clientId = cachedClientId ?: "d8a5ed958d274c2e8ee717e6a4b0971d"
         val body = buildJsonObject {
             putJsonObject("client_data") {
                 put("client_version", session.clientVersion)
@@ -327,10 +327,22 @@ internal object SpotifyToken {
                 .header("User-Agent", WEBPLAYER_UA)
                 .build()
             Http.client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return@use null
-                val root = response.body?.string()?.let { json.parseToJsonElement(it).jsonObject }
-                root?.get("granted_token")?.jsonObject?.get("token")?.jsonPrimitive?.contentOrNull
+                val responseBody = response.body?.string()
+                if (!response.isSuccessful) {
+                    Log.w(TAG, "fallback client-token request failed, http ${response.code}")
+                    return@use null
+                }
+                val root = responseBody?.let { json.parseToJsonElement(it).jsonObject }
+                val token = root?.get("granted_token")?.jsonObject?.get("token")?.jsonPrimitive?.contentOrNull
+                if (token == null) {
+                    Log.w(TAG, "fallback client-token response had no granted token")
+                } else {
+                    Log.d(TAG, "fallback WebPlayer client token minted")
+                }
+                token
             }
+        }.onFailure {
+            Log.w(TAG, "fallback client-token request threw: ${it.message}")
         }.getOrNull()
     }
 
