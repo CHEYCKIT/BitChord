@@ -277,10 +277,14 @@ internal object SpotifyToken {
                 putJsonObject("js_sdk_data") {
                     put("device_brand", "unknown")
                     put("device_model", "unknown")
-                    put("os", "android")
-                    put("os_version", android.os.Build.VERSION.RELEASE.orEmpty())
+                    // Pathfinder Canvas is requested as the Spotify WebPlayer. The
+                    // client-token identity must match that same client family; an
+                    // Android/smartphone token paired with App-platform=WebPlayer
+                    // makes Spotify return canvas=null even for known Canvas tracks.
+                    put("os", "windows")
+                    put("os_version", "NT 10.0")
                     put("device_id", session.deviceId)
-                    put("device_type", "smartphone")
+                    put("device_type", "computer")
                 }
             }
         }
