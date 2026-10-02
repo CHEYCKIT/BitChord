@@ -300,7 +300,7 @@ object SpotifyCanvas {
         }.getOrNull()
     })
 
-    private fun fetchCanvasUrl(trackUri: String, token: String): String? =
+    private suspend fun fetchCanvasUrl(trackUri: String, token: String): String? =
         when (val answer = fetchCanvasViaPathfinder(trackUri, token)) {
             is SpotifyCanvasQuery.Answer.Found -> {
                 Log.d(TAG, "pathfinder canvas (${answer.type ?: "no type"}) for $trackUri")
