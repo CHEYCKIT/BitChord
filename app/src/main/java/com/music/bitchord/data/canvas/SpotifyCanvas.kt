@@ -81,6 +81,7 @@ object SpotifyCanvas {
             return null
         }
 
+        Log.d(TAG, "matched Spotify track " + hit.uri)
         val canvasUrl = fetchCanvasUrl(hit.uri, token)
         if (canvasUrl == null) {
             Log.d(TAG, "no canvas for '$title' by '$artist' (matched '${hit.title}', no clip)")
@@ -139,6 +140,8 @@ object SpotifyCanvas {
             "Client-Token" to clientToken,
             "App-platform" to "WebPlayer",
             "Accept" to "application/json",
+            "Origin" to "https://open.spotify.com",
+            "Referer" to "https://open.spotify.com/",
             "User-Agent" to CANVAS_UA,
         )
         val (code, body) = canvasGetWithStatus(url, headers)
@@ -147,6 +150,7 @@ object SpotifyCanvas {
             return null
         }
         val root = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull()
+        Log.d(TAG, "pathfinder search HTTP $code; body=" + body.take(500))
         val firstItem = root?.get("data")?.jsonObject
             ?.get("searchV2")?.jsonObject
             ?.get("tracksV2")?.jsonObject
@@ -327,8 +331,15 @@ object SpotifyCanvas {
                 response.code to if (response.isSuccessful) response.body?.string() else null
             }
         }.getOrElse { return SpotifyCanvasQuery.Answer.Failed("request threw: ${it.message}") }
-        if (body == null) return SpotifyCanvasQuery.Answer.Failed("http $code")
+        if (body == null) {
+            Log.w(TAG, "pathfinder canvas HTTP $code for $trackUri")
+            return SpotifyCanvasQuery.Answer.Failed("http $code")
+        }
+        Log.d(TAG, "pathfinder canvas HTTP $code for $trackUri; body=" + body.take(300))
         val answer = SpotifyCanvasQuery.parse(body)
+        if (answer is SpotifyCanvasQuery.Answer.Failed) {
+            Log.w(TAG, "pathfinder canvas parse result for $trackUri: $answer")
+        }
         if (answer is SpotifyCanvasQuery.Answer.Failed && answer.staleHash && !isRetry) {
             return fetchCanvasViaPathfinder(trackUri, token, isRetry = true)
         }
