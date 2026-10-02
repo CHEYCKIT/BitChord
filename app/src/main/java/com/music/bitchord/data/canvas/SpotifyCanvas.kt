@@ -321,6 +321,30 @@ object SpotifyCanvas {
 
     private suspend fun fetchCanvasViaPathfinder(trackUri: String, token: String, isRetry: Boolean = false): SpotifyCanvasQuery.Answer {
         val hash = queryHashes.canvasHash(forceRefresh = isRetry)
+
+        // Keep the authenticated WebPlayer alive while Pathfinder is called.
+        if (!isRetry) {
+            val webPlayerBody = SpotifyToken.canvasViaWebPlayer(trackUri, hash)
+            if (webPlayerBody != null) {
+                val webPlayerAnswer = SpotifyCanvasQuery.parse(webPlayerBody)
+                when (webPlayerAnswer) {
+                    is SpotifyCanvasQuery.Answer.Found -> {
+                        Log.d(TAG, "WebPlayer canvas (${webPlayerAnswer.type ?: "no type"}) for $trackUri")
+                        return webPlayerAnswer
+                    }
+                    is SpotifyCanvasQuery.Answer.NoCanvas -> {
+                        Log.d(TAG, "WebPlayer Pathfinder returned no canvas for $trackUri")
+                        return webPlayerAnswer
+                    }
+                    is SpotifyCanvasQuery.Answer.Failed -> {
+                        Log.w(TAG, "WebPlayer Pathfinder failed (${webPlayerAnswer.reason}); falling back to OkHttp")
+                    }
+                }
+            } else {
+                Log.w(TAG, "WebPlayer Canvas request returned no response; falling back to OkHttp")
+            }
+        }
+
         val clientToken = SpotifyToken.clientToken()
         Log.d(TAG, "pathfinder canvas request hash=${hash.take(12)} clientToken=${clientToken != null}")
         val request = Request.Builder()
