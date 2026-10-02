@@ -319,25 +319,59 @@ object SpotifyCanvas {
             }
         }
 
-    private fun fetchCanvasViaPathfinder(trackUri: String, token: String, isRetry: Boolean = false): SpotifyCanvasQuery.Answer {
+    private suspend fun fetchCanvasViaPathfinder(trackUri: String, token: String, isRetry: Boolean = false): SpotifyCanvasQuery.Answer {
         val hash = queryHashes.canvasHash(forceRefresh = isRetry)
+        val clientToken = SpotifyToken.clientToken()
+        Log.d(TAG, "pathfinder canvas request hash=${hash.take(12)} clientToken=${clientToken != null}")
         val request = Request.Builder()
             .url(SpotifyCanvasQuery.ENDPOINT)
             .post(SpotifyCanvasQuery.requestBody(trackUri, hash).toRequestBody("application/json".toMediaType()))
             .apply { authHeaders(token).forEach { (name, value) -> header(name, value) } }
-            .header("App-platform", "WebPlayer")
+            .header("Content-Type", "application/json")
+            .header("App-Platform", "WebPlayer")
             .header("Accept", "application/json")
             .header("Accept-Language", "en")
+            .header("Origin", "https://open.spotify.com")
+            .header("Referer", "https://open.spotify.com/")
             .build()
         val (code, body) = runCatching {
             Http.client.newCall(request).execute().use { response ->
-                response.code to if (response.isSuccessful) response.body?.string() else null
+                response.code to response.body?.string()
             }
         }.getOrElse { return SpotifyCanvasQuery.Answer.Failed("request threw: ${it.message}") }
-        if (body == null) return SpotifyCanvasQuery.Answer.Failed("http $code")
+        if (code !in 200..299 || body == null) return SpotifyCanvasQuery.Answer.Failed("http $code")
         val answer = SpotifyCanvasQuery.parse(body)
-        if (answer is SpotifyCanvasQuery.Answer.Failed && answer.staleHash && !isRetry) {
-            return fetchCanvasViaPathfinder(trackUri, token, isRetry = true)
+        if (answer is SpotifyCanvasQuery.Answer.Failed && !isRetry) {
+            if (answer.staleHash) return fetchCanvasViaPathfinder(trackUri, token, isRetry = true)
+            return answer
+        }
+        if (answer is SpotifyCanvasQuery.Answer.NoCanvas && !isRetry) {
+            val fallback = SpotifyToken.fallbackClientToken()
+            if (fallback != null) {
+                Log.d(TAG, "pathfinder canvas returned null; retrying with fallback WebPlayer client token")
+                val retryRequest = Request.Builder()
+                    .url(SpotifyCanvasQuery.ENDPOINT)
+                    .post(SpotifyCanvasQuery.requestBody(trackUri, hash).toRequestBody("application/json".toMediaType()))
+                    .apply { authHeaders(token).forEach { (name, value) -> header(name, value) } }
+                    .header("Client-Token", fallback)
+                    .header("Content-Type", "application/json")
+                    .header("App-Platform", "WebPlayer")
+                    .header("Accept", "application/json")
+                    .header("Accept-Language", "en")
+                    .header("Origin", "https://open.spotify.com")
+                    .header("Referer", "https://open.spotify.com/")
+                    .build()
+                val retryBody = runCatching {
+                    Http.client.newCall(retryRequest).execute().use { response ->
+                        if (response.isSuccessful) response.body?.string() else null
+                    }
+                }.getOrNull()
+                if (retryBody != null) {
+                    val retryAnswer = SpotifyCanvasQuery.parse(retryBody)
+                    if (retryAnswer is SpotifyCanvasQuery.Answer.Found) return retryAnswer
+                    Log.d(TAG, "fallback client-token canvas result: $retryAnswer")
+                }
+            }
         }
         return answer
     }
