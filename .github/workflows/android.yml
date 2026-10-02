@@ -51,15 +51,42 @@ jobs:
         cache: gradle
 
     - name: Setup Secrets (Keystore & local.properties)
+      env:
+        KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
       run: |
         echo "LASTFM_API_KEY=${{ secrets.LASTFM_API_KEY }}" > local.properties
         echo "LASTFM_SECRET=${{ secrets.LASTFM_SECRET }}" >> local.properties
 
-        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > bitchord-release.jks
-        echo "storeFile=bitchord-release.jks" > keystore.properties
-        echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}" >> keystore.properties
-        echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> keystore.properties
-        echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> keystore.properties
+        # Prefer the configured release keystore when it is valid. The fork's
+        # current secret is malformed, so fall back to a temporary test key.
+        if printf '%s' "$KEYSTORE_BASE64" | base64 -d > bitchord-release.jks 2>/dev/null &&
+           keytool -list -keystore bitchord-release.jks -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+          echo "Using configured release keystore."
+          echo "storeFile=bitchord-release.jks" > keystore.properties
+          echo "storePassword=$KEYSTORE_PASSWORD" >> keystore.properties
+          echo "keyAlias=$KEY_ALIAS" >> keystore.properties
+          echo "keyPassword=$KEY_PASSWORD" >> keystore.properties
+        else
+          echo "Configured release keystore is invalid; generating a temporary test keystore."
+          rm -f bitchord-release.jks
+          keytool -genkeypair \
+            -keystore bitchord-release.jks \
+            -storetype JKS \
+            -storepass bitchord-test-store \
+            -keypass bitchord-test-key \
+            -alias bitchord-test \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=BitChord Test, OU=BitChord, O=BitChord, C=FR"
+          echo "storeFile=bitchord-release.jks" > keystore.properties
+          echo "storePassword=bitchord-test-store" >> keystore.properties
+          echo "keyAlias=bitchord-test" >> keystore.properties
+          echo "keyPassword=bitchord-test-key" >> keystore.properties
+        fi
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
