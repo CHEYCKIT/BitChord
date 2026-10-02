@@ -4,7 +4,7 @@ on: [push, pull_request]
 
 jobs:
   build-dev-debug:
-    if: github.ref != 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
