@@ -247,8 +247,12 @@ internal object SpotifyToken {
     private class CanvasBridge(private val deferred: CompletableDeferred<String?>) {
         @JavascriptInterface fun onCanvasResponse(payload: String?) {
             if (!deferred.isCompleted && !payload.isNullOrBlank()) {
-                Log.d(TAG, "captured WebPlayer Pathfinder response (${payload.length} bytes)")
-                deferred.complete(payload)
+                if (payload.contains("\"canvas\":{")) {
+                    Log.d(TAG, "captured WebPlayer Pathfinder Canvas response (${payload.length} bytes)")
+                    deferred.complete(payload)
+                } else {
+                    Log.d(TAG, "captured WebPlayer Pathfinder track response without Canvas (${payload.length} bytes); continuing")
+                }
             }
         }
     }
