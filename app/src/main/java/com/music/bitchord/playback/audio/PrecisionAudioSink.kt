@@ -24,6 +24,8 @@ import java.nio.ByteOrder
  *   decoder PCM -> PcmBoundary.decode -> AudioBlock (Float32) -> DspChain (Spatial -> EQ -> Transition)
  *   -> PcmBoundary.encode -> delegate [DefaultAudioSink].
  *   Internal DSP precision and AudioTrack output precision are independent:
+ *   - Packed24-capable delegate (explicitly preferred and supported directly):
+ *     encodes to packed PCM24. [DefaultAudioSink] does not provide this path.
  *   - Float-capable route ([enableFloatOutput] is true and the delegate opens float natively):
  *     encodes to Float32 PCM -> delegate [DefaultAudioSink] (configured for Float32).
  *   - PCM16-only route ([enableFloatOutput] is false or unsupported by route/hardware):
@@ -38,13 +40,16 @@ import java.nio.ByteOrder
  *
  * ## Output encoding
  *
- * [DefaultAudioSink] has exactly two linear-PCM output encodings: float, and 16-bit.
+ * Media3 1.11.0's [DefaultAudioSink] has exactly two linear-PCM output encodings:
+ * float, and 16-bit.
  * Its `configure` puts `ToInt16PcmAudioProcessor` in the chain for every input
  * encoding whenever float output is off, and `ToFloatPcmAudioProcessor` when it is
  * on. There is no 24-bit or 32-bit AudioTrack path through it, so asking for one
- * gets a silent downconvert rather than what was asked for — which is why
- * [resolveTargetEncoding] only ever answers float or 16-bit, however high-res the
- * route claims to be.
+ * gets a downconvert rather than what was asked for. [resolveTargetEncoding]
+ * accepts a packed24 preference only when the delegate reports
+ * [AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY] for that exact format; device
+ * advertisement alone is insufficient. DefaultAudioSink reports transcoding
+ * for packed24, so it still receives only float or 16-bit.
  *
  * Float is checked with [AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY] rather than
  * `supportsFormat`, which is too weak to be a gate: with float output disabled,
@@ -140,6 +145,7 @@ class PrecisionAudioSink(
     override fun configure(audioSinkConfig: AudioSink.AudioSinkConfig) {
         val format = audioSinkConfig.format
         activeFormat = format
+        var lastConfigurationFailure: AudioSink.ConfigurationException? = null
 
         if (shouldActivatePrecision(format)) {
             val encoding = mapToPcmEncoding(format.pcmEncoding)
@@ -158,29 +164,41 @@ class PrecisionAudioSink(
                 val floatFormat = format.buildUpon()
                     .setPcmEncoding(C.ENCODING_PCM_FLOAT)
                     .build()
-                val pcm16Format = format.buildUpon()
-                    .setPcmEncoding(C.ENCODING_PCM_16BIT)
-                    .build()
-
-                val targetEncoding = resolveTargetEncoding(
+                val preferredTarget = resolveTargetEncoding(
                     preferred = preferredOutputEncodingProvider?.invoke(format),
                     floatFormat = floatFormat,
                 )
+                // Try each precision output at most once, starting with the preference.
+                // A native packed24 delegate may still reject this configuration.
+                val targetEncodings = buildList {
+                    add(preferredTarget)
+                    if (preferredTarget == PcmEncoding.PCM_24BIT_PACKED && floatIsNative(floatFormat)) {
+                        add(PcmEncoding.PCM_FLOAT)
+                    }
+                    if (preferredTarget != PcmEncoding.PCM_16BIT) {
+                        add(PcmEncoding.PCM_16BIT)
+                    }
+                }
 
-                // 4. Configure delegate DefaultAudioSink
-                val delegateFormat = format.buildUpon()
-                    .setPcmEncoding(targetEncoding.toMedia3PcmEncoding())
-                    .build()
+                // 4. Configure the delegate, falling back through float and PCM16.
+                for (targetEncoding in targetEncodings) {
+                    val delegateFormat = format.buildUpon()
+                        .setPcmEncoding(targetEncoding.toMedia3PcmEncoding())
+                        .build()
 
-                val delegateConfig = AudioSink.AudioSinkConfig.Builder(delegateFormat)
-                    .setPreferredBufferSizeOverride(audioSinkConfig.preferredBufferSizeOverride)
-                    .setOutputChannelMapping(audioSinkConfig.outputChannelMapping)
-                    .setTimeline(audioSinkConfig.timeline)
-                    .setMediaPeriodId(audioSinkConfig.mediaPeriodId)
-                    .build()
+                    val delegateConfig = AudioSink.AudioSinkConfig.Builder(delegateFormat)
+                        .setPreferredBufferSizeOverride(audioSinkConfig.preferredBufferSizeOverride)
+                        .setOutputChannelMapping(audioSinkConfig.outputChannelMapping)
+                        .setTimeline(audioSinkConfig.timeline)
+                        .setMediaPeriodId(audioSinkConfig.mediaPeriodId)
+                        .build()
 
-                try {
-                    delegate.configure(delegateConfig)
+                    try {
+                        delegate.configure(delegateConfig)
+                    } catch (e: AudioSink.ConfigurationException) {
+                        lastConfigurationFailure = e
+                        continue
+                    }
                     inputPcmEncoding = encoding
                     targetOutputEncoding = targetEncoding
                     isPrecisionActive = true
@@ -195,38 +213,6 @@ class PrecisionAudioSink(
                         delegateEncoding = delegateFormat.pcmEncoding,
                     )
                     return
-                } catch (e: Exception) {
-                    // If the Float32 delegate config failed, try PCM16 before aborting precision
-                    if (targetEncoding != PcmEncoding.PCM_16BIT) {
-                        try {
-                            val fallbackPcm16Config = AudioSink.AudioSinkConfig.Builder(pcm16Format)
-                                .setPreferredBufferSizeOverride(audioSinkConfig.preferredBufferSizeOverride)
-                                .setOutputChannelMapping(audioSinkConfig.outputChannelMapping)
-                                .setTimeline(audioSinkConfig.timeline)
-                                .setMediaPeriodId(audioSinkConfig.mediaPeriodId)
-                                .build()
-                            delegate.configure(fallbackPcm16Config)
-                            inputPcmEncoding = encoding
-                            targetOutputEncoding = PcmEncoding.PCM_16BIT
-                            isPrecisionActive = true
-                            publishTelemetry(encoding, PcmEncoding.PCM_16BIT)
-                            logConfig(
-                                precisionActive = true,
-                                inputEncoding = encoding.name,
-                                sampleRate = sampleRate,
-                                channelCount = channelCount,
-                                targetOutputEncoding = PcmEncoding.PCM_16BIT.name,
-                                enableFloatOutput = enableFloatOutput,
-                                delegateEncoding = pcm16Format.pcmEncoding,
-                            )
-                            return
-                        } catch (e2: Exception) {
-                            // Delegate configuration failed completely; fall back safely
-                        }
-                    }
-                    isPrecisionActive = false
-                    inputPcmEncoding = null
-                    targetOutputEncoding = null
                 }
             }
         }
@@ -250,7 +236,13 @@ class PrecisionAudioSink(
                 dspAvailable = false,
             )
         }
-        delegate.configure(audioSinkConfig)
+        try {
+            delegate.configure(audioSinkConfig)
+        } catch (e: AudioSink.ConfigurationException) {
+            // Keep the final precision failure for diagnostics if legacy also fails.
+            lastConfigurationFailure?.takeIf { it !== e }?.let(e::addSuppressed)
+            throw e
+        }
         logConfig(
             precisionActive = false,
             inputEncoding = format.pcmEncoding.toString(),
@@ -344,7 +336,7 @@ class PrecisionAudioSink(
             // Process normalized Float32 samples through custom DSP chain
             dspChain.process(audioBlock)
 
-            // Encode processed samples to target PCM output buffer (Float32 or PCM16)
+            // Encode processed samples to the negotiated PCM output buffer.
             outputByteBuffer.clear()
             PcmBoundary.encode(
                 sourceBlock = audioBlock,
@@ -551,17 +543,23 @@ class PrecisionAudioSink(
             delegate.getFormatSupport(floatFormat) == AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
 
     /**
-     * The encoding handed to the delegate, which is only ever float or 16-bit.
+     * The encoding handed to the delegate, preferring packed 24-bit when the
+     * active AudioSink explicitly supports it and falling back to float/16-bit.
      *
-     * [OutputNegotiator] can name PCM_24BIT_PACKED when a route advertises packed
-     * 24-bit, and that used to be passed straight through. It cannot be honoured:
-     * [DefaultAudioSink] has no 24-bit AudioTrack path, so it quietly converted the
-     * result again — to 16-bit whenever float output was off — leaving a needless
-     * extra quantization in the middle and a route summary claiming 24 bits that
-     * were never written. A preference for more than 16 bits is therefore read as
-     * what it is, a request for float, and honoured only where float is real.
+     * A preference or device advertisement cannot establish native support.
+     * Only SUPPORTED_DIRECTLY for the requested rate and channel count permits
+     * packed24. [DefaultAudioSink] always reports WITH_TRANSCODING for PCM24;
+     * with that delegate, a 24-bit preference still means float or 16-bit.
      */
     private fun resolveTargetEncoding(preferred: PcmEncoding?, floatFormat: Format): PcmEncoding {
+        if (preferred == PcmEncoding.PCM_24BIT_PACKED) {
+            val pcm24Format = floatFormat.buildUpon()
+                .setPcmEncoding(C.ENCODING_PCM_24BIT)
+                .build()
+            if (delegate.getFormatSupport(pcm24Format) == AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY) {
+                return PcmEncoding.PCM_24BIT_PACKED
+            }
+        }
         val wantsAbove16Bit = when (preferred) {
             PcmEncoding.PCM_16BIT -> return PcmEncoding.PCM_16BIT
             PcmEncoding.PCM_FLOAT, PcmEncoding.PCM_24BIT_PACKED, PcmEncoding.PCM_32BIT -> true
@@ -615,23 +613,27 @@ class PrecisionAudioSink(
      *
      * The combinations that are genuinely lossless:
      *
-     * - 16-bit source to a 16-bit track. [PcmBoundary] scales by 32768, a power
-     *   of two, so the float round trip recovers every original integer.
+     * - 16-bit source to a 16-bit or float track. [PcmBoundary] scales by 32768,
+     *   a power of two, so float represents every original integer exactly.
+     * - A 16-bit or 24-bit source to a packed 24-bit track, which preserves the
+     *   normalized sample values without an additional quantization step.
      * - 24-bit source to a float track. Scaled by 8388608, likewise exact, and
      *   float32 has the 24 bits of significand to hold the result.
      * - A float source to a float track, which is a copy.
      *
-     * Everything else is inexact, and there are two of those worth naming. A
-     * hi-res source on a route that will not open a float track gets 16-bit,
-     * because Media3 offers nothing between. And **32-bit integer PCM cannot be
-     * delivered exactly at all** — float32 carries 24 bits of significand, so
-     * eight bits go regardless of route, and no setting in this app can change
-     * that while [DefaultAudioSink] is doing the writing.
+     * Everything else is inexact. A
+     * hi-res source falling back to 16-bit loses precision, as does float
+     * quantized to packed24. And **32-bit integer PCM cannot be delivered
+     * exactly at all** — the canonical Float32 block carries only 24 bits of
+     * significand, regardless of the delegate's output encoding.
      */
     private fun publishOutputExactness(source: PcmEncoding, target: PcmEncoding) {
         val exact = when (source) {
-            PcmEncoding.PCM_16BIT -> target == PcmEncoding.PCM_16BIT
-            PcmEncoding.PCM_24BIT_PACKED -> target == PcmEncoding.PCM_FLOAT
+            PcmEncoding.PCM_16BIT -> target == PcmEncoding.PCM_16BIT ||
+                target == PcmEncoding.PCM_24BIT_PACKED ||
+                target == PcmEncoding.PCM_FLOAT
+            PcmEncoding.PCM_24BIT_PACKED -> target == PcmEncoding.PCM_24BIT_PACKED ||
+                target == PcmEncoding.PCM_FLOAT
             PcmEncoding.PCM_FLOAT -> target == PcmEncoding.PCM_FLOAT
             // 24 bits of significand cannot hold 32.
             PcmEncoding.PCM_32BIT -> false
@@ -641,7 +643,8 @@ class PrecisionAudioSink(
             exact -> "$sourceLabel → ${encodingLabel(mapFromPcmEncoding(target))}"
             source == PcmEncoding.PCM_32BIT ->
                 "32-bit PCM exceeds what AudioTrack can carry; 8 bits lost"
-            else -> "$sourceLabel → 16-bit; this route cannot open a float track"
+            else ->
+                "$sourceLabel → ${encodingLabel(mapFromPcmEncoding(target))}; route cannot carry the source exactly"
         }
         AudioOutputStatus.publishOutputExactness(exact = exact, detail = detail)
     }

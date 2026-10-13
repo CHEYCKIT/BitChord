@@ -9,6 +9,7 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.util.Util
 import androidx.media3.exoplayer.audio.AudioSink
+import com.google.common.primitives.ImmutableIntArray
 import com.music.bitchord.playback.AudioOutputStatus
 import com.music.bitchord.playback.EqualizerProcessor
 import com.music.bitchord.playback.SpatialAudioProcessor
@@ -18,6 +19,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.ByteBuffer
@@ -28,6 +30,9 @@ class PrecisionAudioSinkTest {
 
     private class FakeAudioSink : AudioSink {
         var configuredConfig: AudioSink.AudioSinkConfig? = null
+        val configureAttempts = mutableListOf<AudioSink.AudioSinkConfig>()
+        var rejectedEncodings: Set<Int> = emptySet()
+        var configureFailure: RuntimeException? = null
         private var sinkListener: AudioSink.Listener? = null
         var flushed: Boolean = false
         var resetCount: Int = 0
@@ -68,6 +73,14 @@ class PrecisionAudioSinkTest {
         override fun getCurrentPositionUs(sourceEnded: Boolean): Long = 0L
 
         override fun configure(audioSinkConfig: AudioSink.AudioSinkConfig) {
+            configureAttempts.add(audioSinkConfig)
+            configureFailure?.let { throw it }
+            if (audioSinkConfig.format.pcmEncoding in rejectedEncodings) {
+                throw AudioSink.ConfigurationException(
+                    "Test delegate rejected encoding ${audioSinkConfig.format.pcmEncoding}",
+                    audioSinkConfig.format,
+                )
+            }
             this.configuredConfig = audioSinkConfig
         }
 
@@ -144,11 +157,13 @@ class PrecisionAudioSinkTest {
         delegate: AudioSink,
         enableFloatOutput: Boolean = true,
         dspChain: DspChain = idleDspChain(),
+        preferredOutputEncoding: PcmEncoding? = null,
     ): PrecisionAudioSink {
         return PrecisionAudioSink(
             delegate = delegate,
             dspChain = dspChain,
             enableFloatOutput = enableFloatOutput,
+            preferredOutputEncodingProvider = { preferredOutputEncoding },
         )
     }
 
@@ -158,6 +173,28 @@ class PrecisionAudioSinkTest {
         .setChannelCount(channelCount)
         .setSampleRate(48000)
         .build()
+
+    private fun packed24Buffer(samples: IntArray): ByteBuffer =
+        ByteBuffer.allocate(samples.size * 3).order(ByteOrder.LITTLE_ENDIAN).apply {
+            samples.forEach { sample ->
+                put((sample and 0xFF).toByte())
+                put(((sample shr 8) and 0xFF).toByte())
+                put(((sample shr 16) and 0xFF).toByte())
+            }
+            flip()
+        }
+
+    private fun assertPacked24Samples(samples: IntArray, buffer: ByteBuffer) {
+        // Inspect a view so assertions do not change the pending-output state.
+        val handed = buffer.duplicate().apply { rewind() }
+        assertEquals(samples.size * 3, handed.remaining())
+        samples.forEachIndexed { i, expected ->
+            val low = handed.get().toInt() and 0xFF
+            val middle = handed.get().toInt() and 0xFF
+            val high = handed.get().toInt()
+            assertEquals("sample $i altered", expected, (high shl 16) or (middle shl 8) or low)
+        }
+    }
 
     // ---- Bit-exactness -----------------------------------------------------
     //
@@ -213,6 +250,85 @@ class PrecisionAudioSinkTest {
         }
     }
 
+    @Test
+    fun `16-bit to float preserves every sample and reports exact encoding`() {
+        val fakeDelegate = FakeAudioSink()
+        val sink = createSink(fakeDelegate)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(rawFormat(C.ENCODING_PCM_16BIT)).build())
+
+        assertEquals(PcmEncoding.PCM_FLOAT, sink.targetOutputEncoding)
+        assertTrue(AudioOutputStatus.current.value.outputExact)
+        val samples = shortArrayOf(0, 1, -1, 32767, -32768, 12345, -12345, 255)
+        val input = ByteBuffer.allocate(samples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        samples.forEach(input::putShort)
+        input.flip()
+
+        assertTrue(sink.handleBuffer(input, 0L, 1))
+        assertFalse(input.hasRemaining())
+        val handed = fakeDelegate.lastHandledBuffer!!.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        handed.rewind()
+        assertEquals(samples.size * 4, handed.remaining())
+        samples.forEachIndexed { i, expected ->
+            assertEquals("sample $i altered", expected.toFloat() / 32768f, handed.getFloat(), 0f)
+        }
+    }
+
+    @Test
+    fun `native packed24 preserves low bits and extremes across delegate backpressure`() {
+        val fakeDelegate = FakeAudioSink().apply { bytesToConsumePerCall = 6 }
+        val sink = createSink(
+            fakeDelegate,
+            enableFloatOutput = false,
+            preferredOutputEncoding = PcmEncoding.PCM_24BIT_PACKED,
+        )
+        sink.configure(AudioSink.AudioSinkConfig.Builder(rawFormat(C.ENCODING_PCM_24BIT)).build())
+
+        assertTrue(sink.isPrecisionActive)
+        assertEquals(PcmEncoding.PCM_24BIT_PACKED, sink.inputPcmEncoding)
+        assertEquals(PcmEncoding.PCM_24BIT_PACKED, sink.targetOutputEncoding)
+        assertEquals(C.ENCODING_PCM_24BIT, fakeDelegate.configuredConfig!!.format.pcmEncoding)
+        assertTrue(AudioOutputStatus.current.value.outputExact)
+        val samples = intArrayOf(0, 1, -1, 8388607, -8388608, 0x123456, -0x123456, 255, -256, 65537)
+        val input = packed24Buffer(samples)
+
+        assertFalse(sink.handleBuffer(input, 123456L, 1))
+        assertFalse(input.hasRemaining())
+        val pending = fakeDelegate.lastHandledBuffer!!
+        assertEquals(6, pending.position())
+        assertPacked24Samples(samples, pending)
+        assertTrue(sink.hasPendingData())
+
+        fakeDelegate.bytesToConsumePerCall = Int.MAX_VALUE
+        assertTrue(sink.handleBuffer(input, 123456L, 1))
+        assertSame(pending, fakeDelegate.lastHandledBuffer)
+        assertEquals(samples.size * 3, pending.position())
+        assertEquals(2, fakeDelegate.handleBufferCallCount)
+        assertEquals(123456L, fakeDelegate.lastPresentationTimeUs)
+        assertFalse(sink.hasPendingData())
+        assertPacked24Samples(samples, pending)
+    }
+
+    @Test
+    fun `16-bit to native packed24 is exact left aligned PCM`() {
+        val fakeDelegate = FakeAudioSink()
+        val sink = createSink(fakeDelegate, preferredOutputEncoding = PcmEncoding.PCM_24BIT_PACKED)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(rawFormat(C.ENCODING_PCM_16BIT)).build())
+
+        assertEquals(PcmEncoding.PCM_24BIT_PACKED, sink.targetOutputEncoding)
+        assertTrue(AudioOutputStatus.current.value.outputExact)
+        val samples = shortArrayOf(0, 1, -1, 32767, -32768, 12345, -12345, 255)
+        val input = ByteBuffer.allocate(samples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        samples.forEach(input::putShort)
+        input.flip()
+
+        assertTrue(sink.handleBuffer(input, 0L, 1))
+        assertFalse(input.hasRemaining())
+        assertPacked24Samples(
+            IntArray(samples.size) { samples[it].toInt() shl 8 },
+            fakeDelegate.lastHandledBuffer!!,
+        )
+    }
+
     /**
      * 24-bit in, float out, and the float carries the original integer exactly.
      *
@@ -224,8 +340,17 @@ class PrecisionAudioSinkTest {
      */
     @Test
     fun `24-bit goes to float and survives exactly`() {
-        val fakeDelegate = FakeAudioSink()
-        val sink = createSink(fakeDelegate)
+        val fakeDelegate = FakeAudioSink().apply {
+            // DefaultAudioSink accepts packed24 only by converting it internally.
+            formatSupportPredicate = { format ->
+                if (format.pcmEncoding == C.ENCODING_PCM_24BIT) {
+                    AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
+                } else {
+                    AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+                }
+            }
+        }
+        val sink = createSink(fakeDelegate, preferredOutputEncoding = PcmEncoding.PCM_24BIT_PACKED)
         sink.configure(AudioSink.AudioSinkConfig.Builder(rawFormat(C.ENCODING_PCM_24BIT)).build())
 
         assertEquals(PcmEncoding.PCM_24BIT_PACKED, sink.inputPcmEncoding)
@@ -236,22 +361,17 @@ class PrecisionAudioSinkTest {
         // Including the extremes and values whose low byte would vanish under
         // any sloppier conversion.
         val samples = intArrayOf(0, 1, -1, 8388607, -8388608, 0x0000FF, 0x7FFFFF, -0x7FFFFF)
-        val input = ByteBuffer.allocate(samples.size * 3).order(ByteOrder.nativeOrder())
-        samples.forEach {
-            input.put((it and 0xFF).toByte())
-            input.put(((it shr 8) and 0xFF).toByte())
-            input.put(((it shr 16) and 0xFF).toByte())
-        }
-        input.flip()
+        val input = packed24Buffer(samples)
 
-        sink.handleBuffer(input, 0L, 1)
+        assertTrue(sink.handleBuffer(input, 0L, 1))
+        assertFalse(input.hasRemaining())
+        assertEquals(listOf(C.ENCODING_PCM_FLOAT), fakeDelegate.configureAttempts.map { it.format.pcmEncoding })
 
         val handed = fakeDelegate.lastHandledBuffer!!.order(ByteOrder.nativeOrder())
         handed.rewind()
+        assertEquals(samples.size * 4, handed.remaining())
         samples.forEachIndexed { i, expected ->
-            // Back to the integer domain the sample started in.
-            val recovered = Math.round(handed.getFloat() * 8388608.0f)
-            assertEquals("sample $i altered", expected, recovered)
+            assertEquals("sample $i altered", expected.toFloat() / 8388608f, handed.getFloat(), 0f)
         }
     }
 
@@ -1042,11 +1162,78 @@ class PrecisionAudioSinkTest {
     }
 
     @Test
+    fun `packed24 input stays direct through float or PCM16 without native packed24 output`() {
+        for (packed24Support in listOf(
+            AudioSink.SINK_FORMAT_UNSUPPORTED,
+            AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING,
+        )) {
+            for (enableFloatOutput in listOf(true, false)) {
+                val fakeDelegate = FakeAudioSink().apply {
+                    formatSupportPredicate = { format ->
+                        when (format.pcmEncoding) {
+                            C.ENCODING_PCM_24BIT -> packed24Support
+                            C.ENCODING_PCM_16BIT -> AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+                            C.ENCODING_PCM_FLOAT -> if (enableFloatOutput) {
+                                AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+                            } else {
+                                AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
+                            }
+                            else -> AudioSink.SINK_FORMAT_UNSUPPORTED
+                        }
+                    }
+                }
+                val sink = createSink(
+                    fakeDelegate,
+                    enableFloatOutput = enableFloatOutput,
+                    preferredOutputEncoding = PcmEncoding.PCM_24BIT_PACKED,
+                )
+                val format = rawFormat(C.ENCODING_PCM_24BIT)
+                assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, sink.getFormatSupport(format))
+                assertTrue(sink.supportsFormat(format))
+                assertEquals(
+                    AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY,
+                    sink.getFormatSupport(rawFormat(C.ENCODING_PCM_32BIT)),
+                )
+                assertEquals(
+                    if (enableFloatOutput) AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+                    else AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING,
+                    sink.getFormatSupport(rawFormat(C.ENCODING_PCM_FLOAT)),
+                )
+
+                sink.configure(AudioSink.AudioSinkConfig.Builder(format).build())
+                val expectedEncoding = if (enableFloatOutput) C.ENCODING_PCM_FLOAT else C.ENCODING_PCM_16BIT
+                assertEquals(listOf(expectedEncoding), fakeDelegate.configureAttempts.map { it.format.pcmEncoding })
+                assertEquals(enableFloatOutput, AudioOutputStatus.current.value.outputExact)
+                val input = packed24Buffer(intArrayOf(1, -1, 8388607, -8388608))
+                assertTrue(sink.handleBuffer(input, 0L, 1))
+                assertFalse(input.hasRemaining())
+                val handed = fakeDelegate.lastHandledBuffer!!.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+                handed.rewind()
+                if (enableFloatOutput) {
+                    assertEquals(16, handed.remaining())
+                    floatArrayOf(1f / 8388608f, -1f / 8388608f, 8388607f / 8388608f, -1f).forEach {
+                        assertEquals(it, handed.getFloat(), 0f)
+                    }
+                } else {
+                    assertEquals(8, handed.remaining())
+                    shortArrayOf(0, 0, 32767, -32768).forEach {
+                        assertEquals(it, handed.getShort())
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     fun `supportsFormat returns true when precision path can transcode to supported output`() {
         val fakeDelegate = FakeAudioSink()
         // Delegate only supports PCM16
-        fakeDelegate.supportsFormatPredicate = { format ->
-            format.pcmEncoding == C.ENCODING_PCM_16BIT
+        fakeDelegate.formatSupportPredicate = { format ->
+            if (format.pcmEncoding == C.ENCODING_PCM_16BIT) {
+                AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+            } else {
+                AudioSink.SINK_FORMAT_UNSUPPORTED
+            }
         }
         val sink = createSink(fakeDelegate, enableFloatOutput = false)
 
@@ -1231,19 +1418,20 @@ class PrecisionAudioSinkTest {
     }
 
     /**
-     * A 24-bit preference is read as "more than 16 bits, please" and answered
-     * with float, never with a packed-24-bit track.
-     *
-     * `DefaultAudioSink.configure` inserts either `ToFloatPcmAudioProcessor` or
-     * `ToInt16PcmAudioProcessor` for every linear-PCM input encoding, so it has
-     * no 24-bit AudioTrack path at all. Handing it a 24-bit format got the
-     * samples quantized here and then converted again downstream — to 16-bit
-     * whenever float output was off — for no gain over asking for float in the
-     * first place.
+     * DefaultAudioSink 1.11.0 always transcodes packed24 internally. A 24-bit
+     * preference must still fall back to float with that production delegate.
      */
     @Test
     fun `a 24-bit preference is honoured as float, since Media3 has no 24-bit track`() {
-        val fakeDelegate = FakeAudioSink()
+        val fakeDelegate = FakeAudioSink().apply {
+            formatSupportPredicate = { format ->
+                if (format.pcmEncoding == C.ENCODING_PCM_24BIT) {
+                    AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
+                } else {
+                    AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+                }
+            }
+        }
         val sink = PrecisionAudioSink(
             delegate = fakeDelegate,
             dspChain = DspChain(spatial = SpatialAudioProcessor(), equalizer = EqualizerProcessor(), transition = TransitionFilterProcessor()),
@@ -1263,13 +1451,50 @@ class PrecisionAudioSinkTest {
         assertEquals(PcmEncoding.PCM_FLOAT, sink.inputPcmEncoding)
         assertEquals(PcmEncoding.PCM_FLOAT, sink.targetOutputEncoding)
         assertEquals(C.ENCODING_PCM_FLOAT, fakeDelegate.configuredConfig?.format?.pcmEncoding)
+        assertEquals(listOf(C.ENCODING_PCM_FLOAT), fakeDelegate.configureAttempts.map { it.format.pcmEncoding })
+        assertTrue(AudioOutputStatus.current.value.outputExact)
+
+        // These values expose an unnecessary intermediate quantization to PCM24.
+        val samples = floatArrayOf(1f / 16777216f, -1f / 16777216f, 0.12345678f, -0.12345678f)
+        val input = ByteBuffer.allocate(samples.size * 4).order(ByteOrder.LITTLE_ENDIAN)
+        samples.forEach(input::putFloat)
+        input.flip()
+        assertTrue(sink.handleBuffer(input, 0L, 1))
+        val handed = fakeDelegate.lastHandledBuffer!!.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        handed.rewind()
+        assertEquals(samples.size * 4, handed.remaining())
+        samples.forEach { assertEquals(it, handed.getFloat(), 0f) }
+    }
+
+    @Test
+    fun `float to native packed24 quantizes samples and reports inexact encoding`() {
+        val fakeDelegate = FakeAudioSink()
+        val sink = createSink(fakeDelegate, preferredOutputEncoding = PcmEncoding.PCM_24BIT_PACKED)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(rawFormat(C.ENCODING_PCM_FLOAT)).build())
+
+        assertEquals(PcmEncoding.PCM_24BIT_PACKED, sink.targetOutputEncoding)
+        assertEquals(C.ENCODING_PCM_24BIT, fakeDelegate.configuredConfig!!.format.pcmEncoding)
+        assertFalse(AudioOutputStatus.current.value.outputExact)
+        assertTrue(AudioOutputStatus.current.value.outputExactDetail.orEmpty().contains("Float32 → 24-bit PCM"))
+        val input = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+        floatArrayOf(1f / 16777216f, -1f / 16777216f, 1f, -1f).forEach(input::putFloat)
+        input.flip()
+
+        assertTrue(sink.handleBuffer(input, 0L, 1))
+        assertPacked24Samples(intArrayOf(1, 0, 8388607, -8388608), fakeDelegate.lastHandledBuffer!!)
     }
 
     /** ...and falls back to 16-bit, not 24-bit, when the route has no float track. */
     @Test
     fun `a 24-bit preference falls back to 16-bit without a float track`() {
         val fakeDelegate = FakeAudioSink().apply {
-            formatSupportReturn = AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
+            formatSupportPredicate = { format ->
+                if (format.pcmEncoding == C.ENCODING_PCM_16BIT) {
+                    AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+                } else {
+                    AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
+                }
+            }
         }
         val sink = PrecisionAudioSink(
             delegate = fakeDelegate,
@@ -1288,6 +1513,151 @@ class PrecisionAudioSinkTest {
 
         assertEquals(PcmEncoding.PCM_16BIT, sink.targetOutputEncoding)
         assertEquals(C.ENCODING_PCM_16BIT, fakeDelegate.configuredConfig?.format?.pcmEncoding)
+        assertEquals(listOf(C.ENCODING_PCM_16BIT), fakeDelegate.configureAttempts.map { it.format.pcmEncoding })
+        assertFalse(AudioOutputStatus.current.value.outputExact)
+        val input = packed24Buffer(intArrayOf(0, 1, -1, 8388607, -8388608, 255, -256, 384))
+        assertTrue(sink.handleBuffer(input, 0L, 1))
+        val handed = fakeDelegate.lastHandledBuffer!!.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        handed.rewind()
+        assertEquals(16, handed.remaining())
+        shortArrayOf(0, 0, 0, 32767, -32768, 1, -1, 2).forEach { assertEquals(it, handed.getShort()) }
+    }
+
+    @Test
+    fun `native packed24 support is checked for the requested rate and channels`() {
+        for (format in listOf(
+            rawFormat(C.ENCODING_PCM_24BIT),
+            rawFormat(C.ENCODING_PCM_24BIT).buildUpon().setSampleRate(96000).build(),
+            rawFormat(C.ENCODING_PCM_24BIT, channelCount = 6),
+        )) {
+            val fakeDelegate = FakeAudioSink().apply {
+                formatSupportPredicate = { candidate ->
+                    if (candidate.pcmEncoding == C.ENCODING_PCM_24BIT &&
+                        (candidate.sampleRate != 48000 || candidate.channelCount != 2)
+                    ) {
+                        AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
+                    } else {
+                        AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+                    }
+                }
+            }
+            val sink = createSink(fakeDelegate, preferredOutputEncoding = PcmEncoding.PCM_24BIT_PACKED)
+            sink.configure(AudioSink.AudioSinkConfig.Builder(format).build())
+
+            val expectedEncoding = if (format.sampleRate == 48000 && format.channelCount == 2) {
+                C.ENCODING_PCM_24BIT
+            } else {
+                C.ENCODING_PCM_FLOAT
+            }
+            assertEquals(listOf(expectedEncoding), fakeDelegate.configureAttempts.map { it.format.pcmEncoding })
+            assertEquals(format.sampleRate, fakeDelegate.configuredConfig!!.format.sampleRate)
+            assertEquals(format.channelCount, fakeDelegate.configuredConfig!!.format.channelCount)
+        }
+    }
+
+    @Test
+    fun `failed native packed24 configuration falls back through enabled float then PCM16`() {
+        for ((enableFloatOutput, floatSupport, rejectFloat) in listOf(
+            Triple(true, AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, false),
+            Triple(true, AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, true),
+            Triple(false, AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, false),
+            Triple(true, AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING, false),
+            Triple(true, AudioSink.SINK_FORMAT_UNSUPPORTED, false),
+        )) {
+            val fakeDelegate = FakeAudioSink().apply {
+                formatSupportPredicate = { format ->
+                    if (format.pcmEncoding == C.ENCODING_PCM_FLOAT) floatSupport
+                    else AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+                }
+                rejectedEncodings = if (rejectFloat) {
+                    setOf(C.ENCODING_PCM_24BIT, C.ENCODING_PCM_FLOAT)
+                } else {
+                    setOf(C.ENCODING_PCM_24BIT)
+                }
+            }
+            val sink = createSink(
+                fakeDelegate,
+                enableFloatOutput = enableFloatOutput,
+                preferredOutputEncoding = PcmEncoding.PCM_24BIT_PACKED,
+            )
+            val channelMapping = ImmutableIntArray.of(1, 0)
+            val config = AudioSink.AudioSinkConfig.Builder(rawFormat(C.ENCODING_PCM_24BIT))
+                .setPreferredBufferSizeOverride(4096)
+                .setOutputChannelMapping(channelMapping)
+                .build()
+            sink.configure(config)
+
+            val canTryFloat = enableFloatOutput && floatSupport == AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+            val expectedAttempts = when {
+                !canTryFloat -> listOf(C.ENCODING_PCM_24BIT, C.ENCODING_PCM_16BIT)
+                rejectFloat -> listOf(C.ENCODING_PCM_24BIT, C.ENCODING_PCM_FLOAT, C.ENCODING_PCM_16BIT)
+                else -> listOf(C.ENCODING_PCM_24BIT, C.ENCODING_PCM_FLOAT)
+            }
+            assertEquals(expectedAttempts, fakeDelegate.configureAttempts.map { it.format.pcmEncoding })
+            fakeDelegate.configureAttempts.forEach { attempt ->
+                assertEquals(config.preferredBufferSizeOverride, attempt.preferredBufferSizeOverride)
+                assertEquals(channelMapping, attempt.outputChannelMapping)
+                assertEquals(config.timeline, attempt.timeline)
+                assertEquals(config.mediaPeriodId, attempt.mediaPeriodId)
+            }
+            val expectFloat = canTryFloat && !rejectFloat
+            assertTrue(sink.isPrecisionActive)
+            assertEquals(PcmEncoding.PCM_24BIT_PACKED, sink.inputPcmEncoding)
+            assertEquals(if (expectFloat) PcmEncoding.PCM_FLOAT else PcmEncoding.PCM_16BIT, sink.targetOutputEncoding)
+            assertEquals(expectFloat, AudioOutputStatus.current.value.outputExact)
+
+            val input = packed24Buffer(intArrayOf(1, -1, 8388607, -8388608))
+            assertTrue(sink.handleBuffer(input, 0L, 1))
+            val handed = fakeDelegate.lastHandledBuffer!!.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+            handed.rewind()
+            if (expectFloat) {
+                assertEquals(16, handed.remaining())
+                floatArrayOf(1f / 8388608f, -1f / 8388608f, 8388607f / 8388608f, -1f).forEach {
+                    assertEquals(it, handed.getFloat(), 0f)
+                }
+            } else {
+                assertEquals(8, handed.remaining())
+                shortArrayOf(0, 0, 32767, -32768).forEach { assertEquals(it, handed.getShort()) }
+            }
+        }
+    }
+
+    @Test
+    fun `configuration programming errors propagate without trying another encoding`() {
+        val bug = IllegalStateException("Delegate programming error")
+        val fakeDelegate = FakeAudioSink().apply { configureFailure = bug }
+        val sink = createSink(fakeDelegate, preferredOutputEncoding = PcmEncoding.PCM_24BIT_PACKED)
+
+        val failure = assertThrows(IllegalStateException::class.java) {
+            sink.configure(AudioSink.AudioSinkConfig.Builder(rawFormat(C.ENCODING_PCM_24BIT)).build())
+        }
+
+        assertSame(bug, failure)
+        assertEquals(listOf(C.ENCODING_PCM_24BIT), fakeDelegate.configureAttempts.map { it.format.pcmEncoding })
+    }
+
+    @Test
+    fun `legacy configuration failure retains the last precision failure`() {
+        val fakeDelegate = FakeAudioSink().apply {
+            rejectedEncodings = setOf(C.ENCODING_PCM_24BIT, C.ENCODING_PCM_FLOAT, C.ENCODING_PCM_16BIT)
+        }
+        val sink = createSink(fakeDelegate, preferredOutputEncoding = PcmEncoding.PCM_24BIT_PACKED)
+
+        val failure = assertThrows(AudioSink.ConfigurationException::class.java) {
+            sink.configure(AudioSink.AudioSinkConfig.Builder(rawFormat(C.ENCODING_PCM_24BIT)).build())
+        }
+
+        assertEquals(
+            listOf(C.ENCODING_PCM_24BIT, C.ENCODING_PCM_FLOAT, C.ENCODING_PCM_16BIT, C.ENCODING_PCM_24BIT),
+            fakeDelegate.configureAttempts.map { it.format.pcmEncoding },
+        )
+        assertEquals(C.ENCODING_PCM_24BIT, failure.format.pcmEncoding)
+        val precisionFailure = failure.suppressed.single() as AudioSink.ConfigurationException
+        assertEquals(C.ENCODING_PCM_16BIT, precisionFailure.format.pcmEncoding)
+        assertFalse(sink.isPrecisionActive)
+        assertNull(sink.inputPcmEncoding)
+        assertNull(sink.targetOutputEncoding)
+        assertFalse(AudioOutputStatus.current.value.outputExact)
     }
 
     @Test
